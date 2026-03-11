@@ -123,8 +123,10 @@ static void update_state(SystemMediaTransportControls &smtc, mpv_handle *mpv)
         auto ch_index = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter");
         auto ch_count = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter-list/count");
         auto pl_count = mp_get_property<MPV_FORMAT_INT64>(mpv, "playlist-count");
+        auto tpos = mp_get_property<MPV_FORMAT_DOUBLE>(mpv, "time-pos").value_or(0);
+        auto ch_thresh = mp_get_property<MPV_FORMAT_DOUBLE>(mpv, "chapter-seek-threshold").value_or(5);
         smtc.IsNextEnabled(pl_count > 1 || ch_count > ch_index.value_or(0));
-        smtc.IsPreviousEnabled(pl_count > 1 || ch_index > 0);
+        smtc.IsPreviousEnabled(pl_count > 1 || ch_index > 0 || (ch_count > 0 && tpos >= ch_thresh));
         smtc.IsRewindEnabled(true);
     } else {
         smtc.PlaybackStatus(MediaPlaybackStatus::Closed);
@@ -277,7 +279,9 @@ static void update_metadata(SystemMediaTransportControls &smtc, smtc_ctx &ctx)
                 auto ch_count = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter-list/count").value_or(0);
                 props.Subtitle(winrt::to_hstring(std::format("{} ({}/{})", ch_title.get(), ch_index + 1, ch_count)));
             }
-        }
+        } // если главы недоступны, помещаем в поле подзаголовка название канала, выложившего ролик
+        else if (mp_string str{ mpv_get_property_string(mpv, "metadata/by-key/uploader") })
+            props.Subtitle(winrt::to_hstring(str.get()));
     } else if (image && !audio) {
         updater.Type(MediaPlaybackType::Image);
         const auto &props = updater.ImageProperties();
@@ -312,10 +316,13 @@ static void handle_mp_event(smtc_ctx *ctx, mpv_event *event)
         update_state(ctx->smtc, ctx->mpv);
         if (event->event_id == MPV_EVENT_PROPERTY_CHANGE) {
             auto &prop = *static_cast<mpv_event_property *>(event->data);
-            if (!strcmp(prop.name, "time-pos") || !strcmp(prop.name, "duration"))
+            if (!strcmp(prop.name, "time-pos") || !strcmp(prop.name, "duration") || !strcmp(prop.name, "pause") || !strcmp(prop.name, "speed"))
                 return;
         }
-        update_metadata(ctx->smtc, *ctx);
+        if (event->event_id != MPV_EVENT_PLAYBACK_RESTART)
+            // эта функция каждый раз заново генерирует/скачивает миниатюру, что вызывает мерцание
+            // поэтому стараемся вызывать её только, если метаданные изменились
+            update_metadata(ctx->smtc, *ctx);
     } catch (const winrt::hresult_error& e) {
         MP_VERBOSE(ctx, "%s: 0x%x - %ls\n", __func__, int32_t(e.code()), e.message().c_str());
     }
@@ -405,12 +412,19 @@ static MP_THREAD_VOID win_event_loop_fn(void *arg)
                 auto ch_index = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter").value_or(0);
                 auto ch_count = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter-list/count");
                 // mpv allows to jump past last chapter
-                mpv_command_string(mpv, ch_index < ch_count ? "add chapter 1" : "playlist-next");
+                // - позволяет, но при включённом повторе ролика воспроизведение начинается заново вместо перехода дальше
+                mpv_command_string(mpv, (ch_index + 1) < ch_count ? "add chapter 1" : "playlist-next");
                 break;
             }
             case SystemMediaTransportControlsButton::Previous: {
                 auto ch_index = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter");
-                mpv_command_string(mpv, ch_index > 0 ? "add chapter -1" : "playlist-prev");
+                auto ch_count = mp_get_property<MPV_FORMAT_INT64>(mpv, "chapter-list/count");
+                // плеер при перемотке на предыдущую главу перемещается в начало текущей, 
+                // если с её начала прошло по умолчанию 5 секунд (что очень удобно)
+                // поэтому делаем то же самое при перемотке с помощью панели SMTC
+                auto tpos = mp_get_property<MPV_FORMAT_DOUBLE>(mpv, "time-pos").value_or(0);
+                auto ch_thresh = mp_get_property<MPV_FORMAT_DOUBLE>(mpv, "chapter-seek-threshold").value_or(5);
+                mpv_command_string(mpv, (ch_index > 0 || (ch_count > 0 && tpos >= ch_thresh)) ? "add chapter -1" : "playlist-prev");
                 break;
             }
             default:
@@ -506,6 +520,7 @@ static MP_THREAD_VOID mpv_event_loop_fn(void *arg)
     mpv_observe_property(mpv, 0, "speed", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv, 0, "time-pos", MPV_FORMAT_INT64);
     mpv_observe_property(mpv, 0, "track-list", MPV_FORMAT_NODE);
+    mpv_observe_property(mpv, 0, "chapter", MPV_FORMAT_INT64); // обновление названия текущей главы в панели SMTC при переходе на следующую по ходу воспроизведения (раньше оно обновлялось только при перемотке и переключении паузы)
     // TODO: Options are not observable, fix me!
     mpv_observe_property(mpv, 0, "loop-file", MPV_FORMAT_DOUBLE);
     mpv_observe_property(mpv, 0, "loop-playlist", MPV_FORMAT_DOUBLE);

@@ -35,6 +35,12 @@
 #include "common/tags.h"
 #include "stream/stream.h"
 
+// параллельная инициалиация раздельных аудио и видео потоков (например, в форматах DASH) для ускорения открытия видео
+// патч от SearchDownload
+#include "osdep/threads.h"
+
+#define NUM_MAX_THREADS 10
+
 #define HEADER "# mpv EDL v0\n"
 
 struct tl_part {
@@ -397,9 +403,7 @@ static void resolve_timestamps(struct tl_part *part, struct demuxer *demuxer)
         part->offset = demuxer->start_time;
 }
 
-static struct timeline_par *build_timeline(struct timeline *root,
-                                           struct tl_root *edl_root,
-                                           struct tl_parts *parts)
+static struct timeline_par *prepare_timeline(struct timeline *root, struct tl_parts *parts)
 {
     struct timeline_par *tl = talloc_zero(root, struct timeline_par);
     MP_TARRAY_APPEND(root, root->pars, root->num_pars, tl);
@@ -416,7 +420,15 @@ static struct timeline_par *build_timeline(struct timeline *root,
         parts->sh_meta[n] = NULL;
     }
     parts->num_sh_meta = 0;
+    
+    return tl;
+}
 
+static void build_timeline(struct timeline *root,
+                           struct tl_root *edl_root,
+                           struct tl_parts *parts,
+                           struct timeline_par *tl)
+{
     if (parts->init_fragment_url && parts->init_fragment_url[0]) {
         MP_VERBOSE(root, "Opening init fragment...\n");
         stream_t *s = stream_create(parts->init_fragment_url,
@@ -558,11 +570,10 @@ static struct timeline_par *build_timeline(struct timeline *root,
         mp_tags_merge(root->meta->metadata, edl_root->tags);
 
     assert(tl->num_parts == parts->num_parts);
-    return tl;
+    return;
 
 error:
     root->num_pars = 0;
-    return NULL;
 }
 
 static void fix_filenames(struct tl_parts *parts, char *source_path)
@@ -584,6 +595,27 @@ static void fix_filenames(struct tl_parts *parts, char *source_path)
     }
 }
 
+
+struct edl_params {
+    struct timeline *tl;
+    struct tl_root *root;
+    struct tl_parts *parts;
+    struct timeline_par *new_tl;
+    int thread_n;
+};
+
+static MP_THREAD_VOID edl_thread(void *p)
+{
+    struct edl_params *params = (struct edl_params *)p;
+    
+    build_timeline(params->tl, params->root, params->parts, params->new_tl);
+    
+    MP_DBG(params->tl, "[patch] Finished thread %d\n", params->thread_n);
+    
+    free(params);
+    return 0;
+}
+
 static void build_mpv_edl_timeline(struct timeline *tl)
 {
     struct priv *p = tl->demuxer->priv;
@@ -598,15 +630,52 @@ static void build_mpv_edl_timeline(struct timeline *tl)
     bool all_no_clip = true;
     bool all_single = true;
 
+    struct timeline_par **future_pars = malloc(root->num_pars * sizeof(struct timeline_par *));
+    mp_thread thread_handles[NUM_MAX_THREADS];
+
     for (int n = 0; n < root->num_pars; n++) {
         struct tl_parts *parts = root->pars[n];
         fix_filenames(parts, tl->demuxer->filename);
-        struct timeline_par *par = build_timeline(tl, root, parts);
-        if (!par)
-            break;
-        all_dash &= par->dash;
-        all_no_clip &= par->no_clip;
-        all_single &= par->num_parts == 1;
+        
+        // инициализация сегментов EDL строго последовательно, чтобы их порядок в списке доступных дорожек был всегда одинаковым
+        future_pars[n] = prepare_timeline(tl, parts);
+        
+        struct edl_params *params = malloc(sizeof(struct edl_params));
+        params->tl = tl;
+        params->root = root;
+        params->parts = parts;
+        params->new_tl = future_pars[n];
+        params->thread_n = n;
+        thread_handles[n] = NULL;
+        
+        // избегаем создание слишком большого числа потоков при открытии комплексных EDL (например, ytdl_hook с all_formats=true)
+        // обычно, в таких EDL все потоки (кроме, возможно, основного, идущего в начале) имеют флаг !delay_open,
+        // поэтому не будут тормозить открытие в синхронном режиме
+        if (n >= NUM_MAX_THREADS) {
+            if (n == NUM_MAX_THREADS)
+                MP_INFO(tl, "[patch] Maximum number of EDL initialization threads (%d) is exceeded - switching to sync init mode\n", NUM_MAX_THREADS);
+            build_timeline(tl, root, parts, future_pars[n]);
+            free(params);
+        }
+        else {
+            int thr_err = mp_thread_create(&thread_handles[n], edl_thread, params);
+            if (thr_err) {
+                MP_ERR(tl, "[patch] Unable to create EDL initialization thread! Using sync fallback\n");
+                build_timeline(tl, root, parts, future_pars[n]);
+                free(params);
+            }
+            else
+                MP_DBG(tl, "[patch] Creating EDL initialization thread %d\n", n);
+        }
+    }
+    
+    for (int n = 0; n < root->num_pars; n++) {
+        if (thread_handles[n])
+            mp_thread_join(thread_handles[n]);
+        
+        all_dash &= future_pars[n]->dash;
+        all_no_clip &= future_pars[n]->no_clip;
+        all_single &= future_pars[n]->num_parts == 1;
     }
 
     if (all_dash) {
@@ -617,6 +686,7 @@ static void build_mpv_edl_timeline(struct timeline *tl)
         tl->format = "edl";
     }
 
+    free(future_pars);
     talloc_free(root);
 }
 

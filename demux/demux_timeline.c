@@ -26,6 +26,12 @@
 #include "stheader.h"
 #include "stream/stream.h"
 
+// параллельная загрузка раздельных аудио и видео потоков (например, в форматах DASH) для ускорения перемотки
+// патч от SearchDownload
+#include "osdep/threads.h"
+
+#define NUM_THREAD_HANDLES 10
+
 struct segment {
     int index; // index into virtual_source.segments[] (and timeline.parts[])
     double start, end;
@@ -88,6 +94,8 @@ struct priv {
 
     struct virtual_source **sources;
     int num_sources;
+    
+    mp_thread thread_handles[NUM_THREAD_HANDLES]; // массив дескрипторов активных потоков перемотки
 };
 
 static void update_slave_stats(struct demuxer *demuxer, struct demuxer *slave)
@@ -210,11 +218,9 @@ static void reopen_lazy_segments(struct demuxer *demuxer,
     if (src->current->d)
         return;
 
-    // Note: in delay_open mode, we must _not_ close segments during demuxing,
+    // Note: we must _not_ close segments during demuxing,
     // because demuxed packets have demux_packet.codec set to objects owned
     // by the segments. Closing them would create dangling pointers.
-    if (!src->delay_open)
-        close_lazy_segments(demuxer, src);
 
     struct demuxer_params params = {
         .init_fragment = src->tl->init_fragment,
@@ -228,6 +234,47 @@ static void reopen_lazy_segments(struct demuxer *demuxer,
     if (src->current->d)
         update_slave_stats(demuxer, src->current->d);
     associate_streams(demuxer, src, src->current);
+}
+
+
+struct seek_params {
+    struct demuxer *tl_demuxer;
+    demuxer_t *seg_demuxer;
+    double start_pts;
+    int flags;
+    struct virtual_source *src;
+    int thr_num;
+    bool is_fallback;
+};
+
+static MP_THREAD_VOID seek_thread(void *p)
+{
+    struct seek_params *params = (struct seek_params *)p;
+
+    // плеер создаёт по отдельному libavformat (библиотека FFmpeg) - демуксеру на каждый сегмент EDL,
+    // а демуксер рассчитан на работу в отдельном потоке,
+    // поэтому такая перемотка, по идее, должна быть потокобезопасной
+    demux_seek(params->seg_demuxer, params->start_pts, params->flags);
+
+    // та же обработка после завершения перемотки, что и при синхронном режиме
+    for (int n = 0; n < params->src->num_streams; n++) {
+        struct virtual_stream *vs = params->src->streams[n];
+        vs->eos_packets = 0;
+    }
+    params->src->eof_reached = false;
+    params->src->eos_packets = 0;
+    
+    params->src->dts = MP_NOPTS_VALUE;
+    TA_FREEP(&params->src->next);
+    // ---------------------------------
+    
+    if (!params->is_fallback)
+        MP_DBG(params->tl_demuxer, "<patch> Finished thread %d (demuxer ID: %p)\n", params->thr_num, params->seg_demuxer);
+    else
+        MP_DBG(params->tl_demuxer, "<patch> Finished sync fallback (demuxer ID: %p)\n", params->seg_demuxer);
+    
+    free(params);
+    return 0;
 }
 
 static void switch_segment(struct demuxer *demuxer, struct virtual_source *src,
@@ -247,18 +294,61 @@ static void switch_segment(struct demuxer *demuxer, struct virtual_source *src,
     if (!new->d)
         return;
     reselect_streams(demuxer);
-    if (!src->no_clip)
+    if (!src->no_clip) {
         demux_set_ts_offset(new->d, new->start - new->d_start);
-    if (!src->no_clip || !init)
-        demux_seek(new->d, start_pts, flags);
-
-    for (int n = 0; n < src->num_streams; n++) {
-        struct virtual_stream *vs = src->streams[n];
-        vs->eos_packets = 0;
+        // перемотку при инициализации (при отключённом !no_clip) по-прежнему выполняем синхронно
+        if (init && start_pts)
+            demux_seek(new->d, start_pts, flags);
     }
 
-    src->eof_reached = false;
-    src->eos_packets = 0;
+    if (!init) {
+        struct seek_params *params = malloc(sizeof(struct seek_params));
+        struct priv *p = demuxer->priv;
+
+        params->tl_demuxer = demuxer;
+        params->seg_demuxer = new->d;
+        params->start_pts = start_pts;
+        params->flags = flags;
+        params->src = src;
+        params->is_fallback = false;
+        
+        // обычно одновременно запускаются лишь 2 потока перемотки (для видео и аудио потоков)
+        // но при использовании комплексных EDL (например, ytdl_hook с all_formats=true) их может быть несколько больше
+        int free_handle = -1;
+        for (int i = 0; i < NUM_THREAD_HANDLES; i++) {
+            if (!p->thread_handles[i]) {
+                free_handle = i;
+                break;
+            }
+        }
+        if (free_handle == -1) {
+            MP_WARN(demuxer, "<patch> Maximum number of seeking threads (%d) is exceeded! Using sync fallback\n", NUM_THREAD_HANDLES);
+            params->is_fallback = true;
+            seek_thread((void *)params);
+            return;
+        }
+        params->thr_num = free_handle;
+        
+        int thr_err = mp_thread_create(&p->thread_handles[free_handle], seek_thread, params);
+        if (thr_err) {
+            MP_ERR(demuxer, "<patch> Unable to create seeking thread! Using sync fallback\n");
+            p->thread_handles[free_handle] = NULL; // чтобы не ждать окончания не запустившегося потока
+            params->is_fallback = true;
+            seek_thread((void *)params);
+            return;
+        }
+        else
+            MP_DBG(demuxer, "<patch> Creating seeking thread %d (demuxer ID: %p)\n", free_handle, new->d);
+    }
+    else {
+        for (int n = 0; n < src->num_streams; n++) {
+            struct virtual_stream *vs = src->streams[n];
+            vs->eos_packets = 0;
+        }
+
+        src->eof_reached = false;
+        src->eos_packets = 0;
+    }
 }
 
 static void do_read_next_packet(struct demuxer *demuxer,
@@ -409,9 +499,6 @@ static void seek_source(struct demuxer *demuxer, struct virtual_source *src,
     }
 
     switch_segment(demuxer, src, new, pts, flags, false);
-
-    src->dts = MP_NOPTS_VALUE;
-    TA_FREEP(&src->next);
 }
 
 static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
@@ -453,13 +540,29 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
 
     if (master) {
         seek_source(demuxer, master, seek_pts, flags);
-        do_read_next_packet(demuxer, master);
+
+        /*do_read_next_packet(demuxer, master);
         if (master->next && master->next->pts != MP_NOPTS_VALUE) {
             // Assume we got a seek target. Actually apply the heuristic.
             MP_VERBOSE(demuxer, "adjust seek target from %f to %f\n", seek_pts,
                        master->next->pts);
             seek_pts = master->next->pts;
             flags &= ~(unsigned)SEEK_FORWARD;
+        }*/
+        
+        // из-за параллельной перемотки потоков не получится применить эту эвристику;
+        // выставление флага точной перемотки на этом этапе уже ничего не решает
+        // поэтому, чтобы не было тишины после перемотки по ключевым кадрам из-за скачка назад до ближайшего ключевого,
+        // в этом случае делаем дополнительно доступными данные аудио перед ожидаемой позицией перемотки
+        // в браузерных веб-плеерах, где и используются отдельные потоки, перемотка бывает только точная,
+        // поэтому там такой проблемы не может возникнуть в принципе
+        if (!(flags & SEEK_HR) && p->num_sources > 1) {
+            // если перемотка происходит вперёд - выбирается ближайший следующий ключевой кадр, и тишины не возникает
+            if (!(flags & SEEK_FORWARD)) {
+                seek_pts = MPMAX(seek_pts - 7, 0);
+                MP_VERBOSE(demuxer, "<patch> Prefetching audio stream due to keyframes seek (workaround)\n");
+            }
+            else flags &= ~(unsigned)SEEK_FORWARD;
         }
     }
 
@@ -467,6 +570,13 @@ static void d_seek(struct demuxer *demuxer, double seek_pts, int flags)
         struct virtual_source *src = p->sources[x];
         if (src != master && src->any_selected)
             seek_source(demuxer, src, seek_pts, flags);
+    }
+    
+    for (int i = 0; i < NUM_THREAD_HANDLES; i++) {
+        if (p->thread_handles[i]) {
+            mp_thread_join(p->thread_handles[i]);
+            p->thread_handles[i] = NULL;
+        }
     }
 }
 
