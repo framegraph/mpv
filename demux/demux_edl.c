@@ -646,7 +646,8 @@ static void build_mpv_edl_timeline(struct timeline *tl)
         params->parts = parts;
         params->new_tl = future_pars[n];
         params->thread_n = n;
-        thread_handles[n] = NULL;
+        if (n < NUM_MAX_THREADS)
+            thread_handles[n] = NULL;
         
         // избегаем создание слишком большого числа потоков при открытии комплексных EDL (например, ytdl_hook с all_formats=true)
         // обычно, в таких EDL все потоки (кроме, возможно, основного, идущего в начале) имеют флаг !delay_open,
@@ -670,7 +671,7 @@ static void build_mpv_edl_timeline(struct timeline *tl)
     }
     
     for (int n = 0; n < root->num_pars; n++) {
-        if (thread_handles[n])
+        if (n < NUM_MAX_THREADS && thread_handles[n])
             mp_thread_join(thread_handles[n]);
         
         all_dash &= future_pars[n]->dash;
